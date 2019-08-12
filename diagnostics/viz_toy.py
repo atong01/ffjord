@@ -38,7 +38,7 @@ def save_trajectory(model, data_samples, savedir, ntimes=101, memory=0.01, devic
         t = 0
         for cnf in model.chain:
             end_time = (cnf.sqrt_end_time * cnf.sqrt_end_time)
-            integration_times = torch.linspace(0, end_time, ntimes)
+            integration_times = torch.linspace(0, end_time, ntimes).to(device)
 
             z_traj, _ = cnf(z_samples, logp_samples, integration_times=integration_times, reverse=True)
             z_traj = z_traj.cpu().numpy()
@@ -82,7 +82,7 @@ def save_trajectory(model, data_samples, savedir, ntimes=101, memory=0.01, devic
                 ax.set_xlim(-4, 4)
                 ax.set_ylim(-4, 4)
                 cmap = matplotlib.cm.get_cmap(None)
-                ax.set_axis_bgcolor(cmap(0.))
+                ax.set_facecolor(cmap(0.))
                 ax.invert_yaxis()
                 ax.get_xaxis().set_ticks([])
                 ax.get_yaxis().set_ticks([])
