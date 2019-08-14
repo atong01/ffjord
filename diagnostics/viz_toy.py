@@ -17,7 +17,7 @@ def makedirs(dirname):
         os.makedirs(dirname)
 
 
-def save_trajectory(model, data_samples, savedir, ntimes=101, memory=0.01, device='cpu'):
+def save_trajectory(model, data_samples, savedir, ntimes=101, end_times=None, memory=0.01, device='cpu'):
     model.eval()
 
     #  Sample from prior
@@ -37,21 +37,48 @@ def save_trajectory(model, data_samples, savedir, ntimes=101, memory=0.01, devic
         logp_grid = torch.sum(standard_normal_logprob(z_grid), 1, keepdim=True)
         t = 0
         for cnf in model.chain:
-            end_time = (cnf.sqrt_end_time * cnf.sqrt_end_time)
-            integration_times = torch.linspace(0, end_time, ntimes).to(device)
 
-            z_traj, _ = cnf(z_samples, logp_samples, integration_times=integration_times, reverse=True)
+            # Construct integration_list
+            if end_times is None:
+                end_times = [(cnf.sqrt_end_time * cnf.sqrt_end_time)]
+            integration_list = [torch.linspace(0, end_times[0], ntimes).to(device)]
+            for i, et in enumerate(end_times[1:]):
+                integration_list.append(torch.linspace(end_times[i], et, ntimes).to(device))
+            full_times = torch.cat(integration_list, 0)
+            print(full_times.shape)
+
+            # Integrate over evenly spaced samples
+            z_traj, logpz = cnf(z_samples, logp_samples, integration_times=integration_list[0], reverse=True)
+            full_traj = [(z_traj, logpz)]
+            for int_times in integration_list[1:]:
+                prev_z, prev_logp = full_traj[-1]
+                z_traj, logpz = cnf(prev_z[-1], prev_logp[-1], integration_times=int_times, reverse=True)
+                full_traj.append((z_traj, logpz))
+            full_zip = list(zip(*full_traj))
+            z_traj = torch.cat(full_zip[0], 0)
+            #z_logp = torch.cat(full_zip[1], 0)
             z_traj = z_traj.cpu().numpy()
 
             grid_z_traj, grid_logpz_traj = [], []
             inds = torch.arange(0, z_grid.shape[0]).to(torch.int64)
             for ii in torch.split(inds, int(z_grid.shape[0] * memory)):
                 _grid_z_traj, _grid_logpz_traj = cnf(
-                    z_grid[ii], logp_grid[ii], integration_times=integration_times, reverse=True
+                    z_grid[ii], logp_grid[ii], integration_times=integration_list[0], reverse=True
                 )
-                _grid_z_traj, _grid_logpz_traj = _grid_z_traj.cpu().numpy(), _grid_logpz_traj.cpu().numpy()
+                full_traj = [(_grid_z_traj, _grid_logpz_traj)]
+                for int_times in integration_list[1:]:
+                    prev_z, prev_logp = full_traj[-1]
+                    _grid_z_traj, _grid_logpz_traj = cnf(
+                        prev_z[-1], prev_logp[-1], integration_times=int_times, reverse=True
+                    )
+                    full_traj.append((_grid_z_traj, _grid_logpz_traj))
+                full_zip = list(zip(*full_traj))
+                _grid_z_traj = torch.cat(full_zip[0], 0).cpu().numpy()
+                _grid_logpz_traj = torch.cat(full_zip[1], 0).cpu().numpy()
+                print(_grid_z_traj.shape)
                 grid_z_traj.append(_grid_z_traj)
                 grid_logpz_traj.append(_grid_logpz_traj)
+                
             grid_z_traj = np.concatenate(grid_z_traj, axis=1)
             grid_logpz_traj = np.concatenate(grid_logpz_traj, axis=1)
 
@@ -106,7 +133,7 @@ def save_trajectory(model, data_samples, savedir, ntimes=101, memory=0.01, devic
                 K = int(K.imag)
                 zs = torch.from_numpy(np.stack([x, y], -1).reshape(K * K, 2)).to(device, torch.float32)
                 logps = torch.zeros(zs.shape[0], 1).to(device, torch.float32)
-                dydt = cnf.odefunc(integration_times[t], (zs, logps))[0]
+                dydt = cnf.odefunc(full_times[t], (zs, logps))[0]
                 dydt = -dydt.cpu().detach().numpy()
                 dydt = dydt.reshape(K, K, 2)
 

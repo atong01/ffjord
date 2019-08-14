@@ -23,7 +23,9 @@ from diagnostics.viz_toy import save_trajectory, trajectory_to_video
 
 SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams', 'fixed_adams']
 parser = argparse.ArgumentParser('Continuous Normalizing Flow')
+parser.add_argument('--test', type=eval, default=False, choices=[True, False])
 parser.add_argument('--img', type=str, required=True)
+parser.add_argument('--img2', type=str, default=None, help="If supplied train on both imas in series")
 parser.add_argument('--data', type=str, default='dummy')
 parser.add_argument(
     "--layer_type", type=str, default="concatsquash",
@@ -87,56 +89,62 @@ device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 
 from PIL import Image
 import numpy as np
 
-img = np.array(Image.open(args.img).convert('L'))
-h, w = img.shape
-xx = np.linspace(-4, 4, w)
-yy = np.linspace(-4, 4, h)
-xx, yy = np.meshgrid(xx, yy)
-xx = xx.reshape(-1, 1)
-yy = yy.reshape(-1, 1)
+def load_data(img_path):
+    img = np.array(Image.open(img_path).convert('L'))
+    h, w = img.shape
+    xx = np.linspace(-4, 4, w)
+    yy = np.linspace(-4, 4, h)
+    xx, yy = np.meshgrid(xx, yy)
+    xx = xx.reshape(-1, 1)
+    yy = yy.reshape(-1, 1)
 
-means = np.concatenate([xx, yy], 1)
-img = img.max() - img
-probs = img.reshape(-1) / img.sum()
+    means = np.concatenate([xx, yy], 1)
+    img = img.max() - img
+    probs = img.reshape(-1) / img.sum()
+    std = np.array([8 / w / 2, 8 / h / 2])
+    return means, probs, std
 
-std = np.array([8 / w / 2, 8 / h / 2])
 
-
-def sample_data(data=None, rng=None, batch_size=200):
+def sample_data(data, rng=None, batch_size=200):
     """data and rng are ignored."""
+    means, probs, std = data
     inds = np.random.choice(int(probs.shape[0]), int(batch_size), p=probs)
     m = means[inds]
     samples = np.random.randn(*m.shape) * std + m
     return samples
 
 
-def get_transforms(model):
+def get_transforms(model, time=None):
+    if time is None:
+        integration_times = None
+    else:
+        integration_times = torch.tensor([0.0, time]).type(torch.float32).to(device)
 
     def sample_fn(z, logpz=None):
         if logpz is not None:
-            return model(z, logpz, reverse=True)
+            return model(z, logpz, integration_times=integration_times, reverse=True)
         else:
-            return model(z, reverse=True)
+            return model(z, integration_times=integration_times, reverse=True)
 
     def density_fn(x, logpx=None):
         if logpx is not None:
-            return model(x, logpx, reverse=False)
+            return model(x, logpx, integration_times=integration_times, reverse=False)
         else:
-            return model(x, reverse=False)
+            return model(x, integration_times=integration_times, reverse=False)
 
     return sample_fn, density_fn
 
 
-def compute_loss(args, model, batch_size=None):
+def compute_loss(args, model, data, batch_size=None, end_times=None):
     if batch_size is None: batch_size = args.batch_size
 
     # load data
-    x = sample_data(args.data, batch_size=batch_size)
+    x = sample_data(data, batch_size=batch_size)
     x = torch.from_numpy(x).type(torch.float32).to(device)
     zero = torch.zeros(x.shape[0], 1).to(x)
 
     # transform to z
-    z, delta_logp = model(x, zero)
+    z, delta_logp = model(x, zero, integration_times=integration_times)
 
     # compute log q(z)
     logpz = standard_normal_logprob(z).sum(1, keepdim=True)
@@ -147,107 +155,122 @@ def compute_loss(args, model, batch_size=None):
 
 
 if __name__ == '__main__':
-
     regularization_fns, regularization_coeffs = create_regularization_fns(args)
     model = build_model_tabular(args, 2, regularization_fns).to(device)
+    img = load_data(args.img)
+
+    if args.img2:
+        img2 = load_data(args.img2)
     if args.spectral_norm: add_spectral_norm(model)
     set_cnf_options(args, model)
 
-    logger.info(model)
-    logger.info("Number of trainable parameters: {}".format(count_parameters(model)))
+    times = [0.5, 1]
+    if args.test:
+        model.load_state_dict(torch.load(args.save + '/checkpt.pth')['state_dict'])
+    else:
+        logger.info(model)
+        logger.info("Number of trainable parameters: {}".format(count_parameters(model)))
 
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    time_meter = utils.RunningAverageMeter(0.93)
-    loss_meter = utils.RunningAverageMeter(0.93)
-    nfef_meter = utils.RunningAverageMeter(0.93)
-    nfeb_meter = utils.RunningAverageMeter(0.93)
-    tt_meter = utils.RunningAverageMeter(0.93)
-
-    end = time.time()
-    best_loss = float('inf')
-    model.train()
-    for itr in range(1, args.niters + 1):
-        optimizer.zero_grad()
-        if args.spectral_norm: spectral_norm_power_iteration(model, 1)
-
-        loss = compute_loss(args, model)
-        loss_meter.update(loss.item())
-
-        if len(regularization_coeffs) > 0:
-            reg_states = get_regularization(model, regularization_coeffs)
-            reg_loss = sum(
-                reg_state * coeff for reg_state, coeff in zip(reg_states, regularization_coeffs) if coeff != 0
-            )
-            loss = loss + reg_loss
-
-        total_time = count_total_time(model)
-        nfe_forward = count_nfe(model)
-
-        loss.backward()
-        optimizer.step()
-
-        nfe_total = count_nfe(model)
-        nfe_backward = nfe_total - nfe_forward
-        nfef_meter.update(nfe_forward)
-        nfeb_meter.update(nfe_backward)
-
-        time_meter.update(time.time() - end)
-        tt_meter.update(total_time)
-
-        log_message = (
-            'Iter {:04d} | Time {:.4f}({:.4f}) | Loss {:.6f}({:.6f}) | NFE Forward {:.0f}({:.1f})'
-            ' | NFE Backward {:.0f}({:.1f}) | CNF Time {:.4f}({:.4f})'.format(
-                itr, time_meter.val, time_meter.avg, loss_meter.val, loss_meter.avg, nfef_meter.val, nfef_meter.avg,
-                nfeb_meter.val, nfeb_meter.avg, tt_meter.val, tt_meter.avg
-            )
-        )
-        if len(regularization_coeffs) > 0:
-            log_message = append_regularization_to_log(log_message, regularization_fns, reg_states)
-
-        logger.info(log_message)
-
-        if itr % args.val_freq == 0 or itr == args.niters:
-            with torch.no_grad():
-                model.eval()
-                test_loss = compute_loss(args, model, batch_size=args.test_batch_size)
-                test_nfe = count_nfe(model)
-                log_message = '[TEST] Iter {:04d} | Test Loss {:.6f} | NFE {:.0f}'.format(itr, test_loss, test_nfe)
-                logger.info(log_message)
-
-                if test_loss.item() < best_loss:
-                    best_loss = test_loss.item()
-                    utils.makedirs(args.save)
-                    torch.save({
-                        'args': args,
-                        'state_dict': model.state_dict(),
-                    }, os.path.join(args.save, 'checkpt.pth'))
-                model.train()
-
-        if itr % args.viz_freq == 0:
-            with torch.no_grad():
-                model.eval()
-                p_samples = sample_data(args.data, batch_size=2000)
-
-                sample_fn, density_fn = get_transforms(model)
-
-                plt.figure(figsize=(9, 3))
-                visualize_transform(
-                    p_samples, torch.randn, standard_normal_logprob, transform=sample_fn, inverse_transform=density_fn,
-                    samples=True, npts=800, device=device
-                )
-                fig_filename = os.path.join(args.save, 'figs', '{:04d}.jpg'.format(itr))
-                utils.makedirs(os.path.dirname(fig_filename))
-                plt.savefig(fig_filename)
-                plt.close()
-                model.train()
+        time_meter = utils.RunningAverageMeter(0.93)
+        loss_meter = utils.RunningAverageMeter(0.93)
+        nfef_meter = utils.RunningAverageMeter(0.93)
+        nfeb_meter = utils.RunningAverageMeter(0.93)
+        tt_meter = utils.RunningAverageMeter(0.93)
 
         end = time.time()
+        best_loss = float('inf')
+        model.train()
+        for itr in range(1, args.niters + 1):
+            for i, im in enumerate([img, img2]):
+                optimizer.zero_grad()
 
-    logger.info('Training has finished.')
+                ### Train
+                if args.spectral_norm: spectral_norm_power_iteration(model, 1)
 
+                integration_times = torch.tensor([0., times[i]]).type(torch.float32).to(device)
+                loss = compute_loss(args, model, im, integration_times=integration_times)
+                loss_meter.update(loss.item())
+
+                if len(regularization_coeffs) > 0:
+                    reg_states = get_regularization(model, regularization_coeffs)
+                    reg_loss = sum(
+                        reg_state * coeff for reg_state, coeff in zip(reg_states, regularization_coeffs) if coeff != 0
+                    )
+                    loss = loss + reg_loss
+
+                total_time = count_total_time(model)
+                nfe_forward = count_nfe(model)
+
+                loss.backward()
+                optimizer.step()
+
+            ### Eval
+            nfe_total = count_nfe(model)
+            nfe_backward = nfe_total - nfe_forward
+            nfef_meter.update(nfe_forward)
+            nfeb_meter.update(nfe_backward)
+
+            time_meter.update(time.time() - end)
+            tt_meter.update(total_time)
+
+            log_message = (
+                'Iter {:04d} | Time {:.4f}({:.4f}) | Loss {:.6f}({:.6f}) | NFE Forward {:.0f}({:.1f})'
+                ' | NFE Backward {:.0f}({:.1f}) | CNF Time {:.4f}({:.4f})'.format(
+                    itr, time_meter.val, time_meter.avg, loss_meter.val, loss_meter.avg, nfef_meter.val, nfef_meter.avg,
+                    nfeb_meter.val, nfeb_meter.avg, tt_meter.val, tt_meter.avg
+                )
+            )
+            if len(regularization_coeffs) > 0:
+                log_message = append_regularization_to_log(log_message, regularization_fns, reg_states)
+
+            logger.info(log_message)
+
+            if itr % args.val_freq == 0 or itr == args.niters:
+                with torch.no_grad():
+                    model.eval()
+                    test_loss = 0
+                    for i, im in enumerate([img, img2]):
+                        integration_times = torch.tensor([0., times[i]]).type(torch.float32).to(device)
+                        test_loss += compute_loss(args, model, im, batch_size=args.test_batch_size, integration_times=integration_times)
+                    test_nfe = count_nfe(model)
+                    log_message = '[TEST] Iter {:04d} | Test Loss {:.6f} | NFE {:.0f}'.format(itr, test_loss, test_nfe)
+                    logger.info(log_message)
+
+                    if test_loss.item() < best_loss:
+                        best_loss = test_loss.item()
+                        utils.makedirs(args.save)
+                        torch.save({
+                            'args': args,
+                            'state_dict': model.state_dict(),
+                        }, os.path.join(args.save, 'checkpt.pth'))
+                    model.train()
+
+            if itr % args.viz_freq == 0:
+                with torch.no_grad():
+                    model.eval()
+                    for i, im in enumerate([img, img2]):
+                        p_samples = sample_data(im, batch_size=2000)
+                        sample_fn, density_fn = get_transforms(model, time=times[i])
+                        plt.figure(figsize=(9, 3))
+                        visualize_transform(
+                            p_samples, torch.randn, standard_normal_logprob, transform=sample_fn, inverse_transform=density_fn,
+                            samples=True, npts=800, device=device
+                        )
+                        fig_filename = os.path.join(args.save, 'figs', '{:04d}_{:01d}.jpg'.format(itr, i+1))
+                        utils.makedirs(os.path.dirname(fig_filename))
+                        plt.savefig(fig_filename)
+                        plt.close()
+                    model.train()
+
+            end = time.time()
+
+        logger.info('Training has finished.')
+
+    logger.info('Plotting trajectory')
     save_traj_dir = os.path.join(args.save, 'trajectory')
     logger.info('Plotting trajectory to {}'.format(save_traj_dir))
-    data_samples = sample_data(args.data, batch_size=2000)
-    save_trajectory(model, data_samples, save_traj_dir, device=device)
+    data_samples = sample_data(img2, batch_size=2000)
+    save_trajectory(model, data_samples, save_traj_dir, device=device, ntimes=100, memory=0.01, end_times=times)
     trajectory_to_video(save_traj_dir)
