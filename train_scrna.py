@@ -19,7 +19,7 @@ from train_misc import add_spectral_norm, spectral_norm_power_iteration
 from train_misc import create_regularization_fns, get_regularization, append_regularization_to_log
 from train_misc import build_model_tabular
 
-from diagnostics.viz_toy import save_trajectory, trajectory_to_video
+from diagnostics.viz_scrna import save_trajectory, trajectory_to_video
 
 SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams', 'fixed_adams']
 parser = argparse.ArgumentParser('Continuous Normalizing Flow')
@@ -96,35 +96,29 @@ def load_data():
     labels = data.data['sample_labels']
     ixs = data.data['ixs']
     labels = labels[ixs]
-    print(np.unique(labels, return_counts=True))
     scaler = StandardScaler()
     scaler.fit(data.emb[ixs])
     transformed = scaler.transform(data.emb[ixs])
-    #transformed = torch.from_numpy(transformed).type(torch.float32).to(device)
-    #labels = torch.from_numpy(labels).type(torch.int32).to(device)
     return transformed, labels, scaler
 
-"""
-def load_data():
+def load_data_full():
     data = atd.EB_Velocity_Dataset()
     labels = data.data['sample_labels']
-    print(np.unique(labels, return_counts=True))
     scaler = StandardScaler()
     scaler.fit(data.emb)
     transformed = scaler.transform(data.emb)
-    #transformed = torch.from_numpy(transformed).type(torch.float32).to(device)
-    #labels = torch.from_numpy(labels).type(torch.int32).to(device)
     return transformed, labels, scaler
-"""
 
 data, labels, scaler = load_data()
 timepoints = np.unique(labels)
-timepoints = [0]
-print(data.shape)
 
 #########
 # SELECT TIMEPOINTS
 #timepoints = timepoints[:2]
+
+# Integration timepoints, where to evaluate the ODE
+int_tps = (timepoints+1) * args.time_length
+
 #########
 
 def inf_sampler(arr, batch_size=None, noise=0.0):
@@ -135,26 +129,46 @@ def inf_sampler(arr, batch_size=None, noise=0.0):
         samples += np.random.randn(*samples.shape) * noise
     return samples
 
+def train_sampler(i):
+    return inf_sampler(data[labels==i], noise=0.1)
+
+def val_sampler(i):
+    return inf_sampler(data[labels==i], batch_size=args.test_batch_size)
+
+def viz_sampler(i):
+    return inf_sampler(data[labels==i], batch_size=args.viz_batch_size)
+
+
+
 full_sampler = lambda: inf_sampler(data, 2000)
-train_samplers = [lambda: inf_sampler(data[labels==i], noise = 0.1) for i in timepoints]
-val_samplers = [lambda: inf_sampler(data[labels==i], args.test_batch_size) for i in timepoints]
-viz_samplers = [lambda: inf_sampler(data[labels==i], args.viz_batch_size) for i in timepoints]
+#train_samplers = [lambda: inf_sampler(data[labels==i], noise = 0.1) for i in timepoints]
+#val_samplers = [lambda: inf_sampler(data[labels==i], args.test_batch_size) for i in timepoints]
+#viz_samplers = [lambda: inf_sampler(data[labels==i], args.viz_batch_size) for i in timepoints]
 
-"""
-import matplotlib.pyplot as plt
+def scatter_timepoints():
+    import matplotlib.pyplot as plt
 
-LOW = -4
-HIGH = 4
-fig, axes = plt.subplots(2,3, figsize=(20,10))
-axes = axes.flatten()
-for i in range(5):
-    ax = axes[i]
-    ax.hist2d(data[labels==i][:,0], data[labels==i][:,1], range=[[LOW,HIGH], [LOW,HIGH]], bins=100)
-plt.savefig('scatter_density.png')
-plt.close()
-exit()
-"""
+    LOW = -4
+    HIGH = 4
+    fig, axes = plt.subplots(2,3, figsize=(20,10))
+    axes = axes.flatten()
+    titles = ['D00-03', 'D06-09', 'D12-15', 'D18-21', 'D24-27', 'Full']
+    for i in range(5):
+        ax = axes[i]
+        dd = np.concatenate([train_sampler(i) for _ in range(10)])
+        ax.hist2d(dd[:,0], dd[:,1], range=[[LOW,HIGH], [LOW,HIGH]], bins=100)
+        ax.invert_yaxis()
+        ax.set_aspect('equal')
+        ax.set_title(titles[i])
+    ax = axes[5]
+    ax.hist2d(data[:,0], data[:,1], range=[[LOW,HIGH], [LOW,HIGH]], bins=100)
+    ax.invert_yaxis()
+    ax.set_aspect('equal')
+    ax.set_title(titles[5])
+    plt.savefig('scatter.png')
+    plt.close()
 
+scatter_timepoints()
 """
 from torch.utils.data import TensorDataset, DataLoader, RandomSampler, BatchSampler
 datasets = [TensorDataset(data[labels==i]) for i in classes]
@@ -163,38 +177,76 @@ data_sampler = [BatchSampler(RandomSampler(d, replacement=True), args.batch_size
 data_loader = [DataLoader(d, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True, sampler=s) for d,s in zip(datasets, data_sampler)]
 """
 
-def get_transforms(model, timepoint):
-    integration_times = torch.tensor([0.0, (timepoint+1) / len(timepoints)]).type(torch.float32).to(device)
+def get_transforms(model, integration_times):
+    """
+    Given a list of integration points,
+    returns a function giving integration times
+    """
     def sample_fn(z, logpz=None):
+        int_list = [torch.tensor([it - args.time_length, it]).type(torch.float32).to(device) 
+                for it in integration_times]
         if logpz is not None:
-            return model(z, logpz, integration_times=integration_times, reverse=True)
+            # TODO this works right?
+            for it in int_list:
+                z, logpz = model(z, logpz, integration_times=it, reverse=True)
+            return z, logpz
         else:
-            return model(z, integration_times=integration_times, reverse=True)
+            for it in int_list:
+                z = model(z, integration_times=it, reverse=True)
+            return z
 
     def density_fn(x, logpx=None):
+        int_list = [torch.tensor([it - args.time_length, it]).type(torch.float32).to(device)
+                for it in integration_times[::-1]]
         if logpx is not None:
-            return model(x, logpx, integration_times=integration_times, reverse=False)
+            for it in int_list:
+                x, logpx = model(x, logpx, integration_times=it, reverse=False)
+            return x, logpx
         else:
-            return model(x, integration_times=integration_times, reverse=False)
+            for it in int_list:
+                x =  model(x, integration_times=it, reverse=False)
+            return x
     return sample_fn, density_fn
 
 
-def compute_loss(args, model, timepoint):
-    integration_times = torch.tensor([0.0, (timepoint+1) / len(timepoints)]).type(torch.float32).to(device)
+def compute_loss(args, model):
+    """
+    Compute loss by integrating backwards from the last time step
+    At each time step integrate back one time step, and concatenate that
+    to samples of the empirical distribution at that previous timestep
+    repeating over and over to calculate the likelihood of samples in
+    later timepoints iteratively, making sure that the ODE is evaluated
+    at every time step to calculate those later points.
+    """
+    deltas = []
+    for i, (itp, tp) in enumerate(zip(int_tps[::-1], timepoints[::-1])): # tp counts down from last
+        integration_times = torch.tensor([itp-args.time_length, itp]).type(torch.float32).to(device)
 
-    # load data
-    x = train_samplers[timepoint]()
-    x = torch.from_numpy(x).type(torch.float32).to(device)
-    zero = torch.zeros(x.shape[0], 1).to(x)
+        # load data
+        x = train_sampler(tp)
+        x = torch.from_numpy(x).type(torch.float32).to(device)
+        if i > 0:
+            x = torch.cat((z, x))
+        zero = torch.zeros(x.shape[0], 1).to(x)
 
-    # transform to z
-    z, delta_logp = model(x, zero, integration_times=integration_times)
+        # transform to previous timepoint
+        z, delta_logp = model(x, zero, integration_times=integration_times)
+        deltas.append(delta_logp)
 
     # compute log q(z)
     logpz = standard_normal_logprob(z).sum(1, keepdim=True)
 
-    logpx = logpz - delta_logp
-    loss = -torch.mean(logpx)
+    logps = [logpz]
+    losses = []
+    for delta_logp in deltas[::-1]:
+        logpx = logps[-1] - delta_logp
+        logps.append(logpx[:-args.batch_size])
+        losses.append(-torch.mean(logpx[-args.batch_size:]))
+    #weights = torch.tensor([0,0,0,0,1]).to(logpx)
+    #weights = torch.tensor([1,0,0,0,0]).to(logpx)
+    #weights = torch.tensor([1,1,1,1,1]).to(logpx)
+    weights = torch.tensor([5,4,3,2,1]).to(logpx)
+    loss = torch.sum(torch.stack(losses) * weights)
     return loss
 
 
@@ -222,29 +274,27 @@ if __name__ == '__main__':
         best_loss = float('inf')
         model.train()
         for itr in range(1, args.niters + 1):
-            # Shuffle timepoints?
-            for tp in timepoints:
-                optimizer.zero_grad()
+            optimizer.zero_grad()
 
-                ### Train
-                if args.spectral_norm: spectral_norm_power_iteration(model, 1)
+            ### Train
+            if args.spectral_norm: spectral_norm_power_iteration(model, 1)
 
-                loss = compute_loss(args, model, tp)
-                loss_meter.update(loss.item())
+            loss = compute_loss(args, model)
+            loss_meter.update(loss.item())
 
-                if len(regularization_coeffs) > 0 and tp == timepoints[-1]:
-                    # Only regularize on the last timepoint
-                    reg_states = get_regularization(model, regularization_coeffs)
-                    reg_loss = sum(
-                        reg_state * coeff for reg_state, coeff in zip(reg_states, regularization_coeffs) if coeff != 0
-                    )
-                    loss = loss + reg_loss
+            if len(regularization_coeffs) > 0 and tp == timepoints[-1]:
+                # Only regularize on the last timepoint
+                reg_states = get_regularization(model, regularization_coeffs)
+                reg_loss = sum(
+                    reg_state * coeff for reg_state, coeff in zip(reg_states, regularization_coeffs) if coeff != 0
+                )
+                loss = loss + reg_loss
 
-                total_time = count_total_time(model)
-                nfe_forward = count_nfe(model)
+            total_time = count_total_time(model)
+            nfe_forward = count_nfe(model)
 
-                loss.backward()
-                optimizer.step()
+            loss.backward()
+            optimizer.step()
 
             ### Eval
             nfe_total = count_nfe(model)
@@ -270,9 +320,7 @@ if __name__ == '__main__':
             if itr % args.val_freq == 0 or itr == args.niters:
                 with torch.no_grad():
                     model.eval()
-                    test_loss = 0
-                    for tp in timepoints:
-                        test_loss += compute_loss(args, model, tp)
+                    test_loss = compute_loss(args, model)
                     test_nfe = count_nfe(model)
                     log_message = '[TEST] Iter {:04d} | Test Loss {:.6f} | NFE {:.0f}'.format(itr, test_loss, test_nfe)
                     logger.info(log_message)
@@ -289,15 +337,15 @@ if __name__ == '__main__':
             if itr % args.viz_freq == 0:
                 with torch.no_grad():
                     model.eval()
-                    for tp in timepoints:
-                        p_samples = viz_samplers[tp]()
-                        sample_fn, density_fn = get_transforms(model, tp)
+                    for i, _ in enumerate(timepoints):
+                        p_samples = viz_sampler(i)
+                        sample_fn, density_fn = get_transforms(model, int_tps[:i+1])
                         plt.figure(figsize=(9, 3))
                         visualize_transform(
                             p_samples, torch.randn, standard_normal_logprob, transform=sample_fn, inverse_transform=density_fn,
                             samples=True, npts=800, device=device
                         )
-                        fig_filename = os.path.join(args.save, 'figs', '{:04d}_{:01d}.jpg'.format(itr, tp+1))
+                        fig_filename = os.path.join(args.save, 'figs', '{:04d}_{:01d}.jpg'.format(itr, i))
                         utils.makedirs(os.path.dirname(fig_filename))
                         plt.savefig(fig_filename)
                         plt.close()
@@ -310,5 +358,5 @@ if __name__ == '__main__':
     save_traj_dir = os.path.join(args.save, 'trajectory')
     logger.info('Plotting trajectory to {}'.format(save_traj_dir))
     data_samples = full_sampler()
-    save_trajectory(model, data_samples, save_traj_dir, device=device, end_times=[1,2,3,4,5], ntimes=101)
+    save_trajectory(model, data_samples, save_traj_dir, device=device, end_times=int_tps, ntimes=101)
     trajectory_to_video(save_traj_dir)
