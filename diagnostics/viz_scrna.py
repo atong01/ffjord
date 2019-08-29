@@ -17,51 +17,6 @@ def makedirs(dirname):
         os.makedirs(dirname)
 
 
-def save_vectors(model, data_samples, savedir, ntimes=101, end_times=None, memory=0.01, device='cpu'):
-    model.eval()
-
-    #  Sample from prior
-    z_samples = data_samples.to(device)
-
-    with torch.no_grad():
-        # We expect the model is a chain of CNF layers wrapped in a SequentialFlow container.
-        logp_samples = torch.sum(standard_normal_logprob(z_samples), 1, keepdim=True)
-        t = 0
-        for cnf in model.chain:
-            # Construct integration_list
-            if end_times is None:
-                end_times = [(cnf.sqrt_end_time * cnf.sqrt_end_time)]
-            integration_list = []
-            #integration_list = [torch.linspace(0, end_times[0], ntimes).to(device)]
-
-            # Start integration at first end_time
-            for i, et in enumerate(end_times[1:]):
-                integration_list.append(torch.linspace(end_times[i], et, ntimes).to(device))
-            full_times = torch.cat(integration_list, 0)
-
-            # Integrate over evenly spaced samples
-            z_traj, logpz = cnf(z_samples, logp_samples, integration_times=integration_list[0], reverse=True)
-            full_traj = [(z_traj, logpz)]
-            for int_times in integration_list[1:]:
-                prev_z, prev_logp = full_traj[-1]
-                z_traj, logpz = cnf(prev_z[-1], prev_logp[-1], integration_times=int_times, reverse=True)
-                full_traj.append((z_traj, logpz))
-            full_zip = list(zip(*full_traj))
-            z_traj = torch.cat(full_zip[0], 0)
-            z_traj = z_traj.cpu().numpy()
-
-            plt.figure(figsize=(8, 8))
-            ax = plt.subplot(aspect="equal")
-            z_traj = np.swapaxes(z_traj, 0, 1)
-            for zk in z_traj:
-            #for zk in z_traj[:,ntimes:,:]:
-                ax.scatter(zk[:,0], zk[:,1], s=1)
-            ax.set_xlim(-4, 4)
-            ax.set_ylim(4, -4)
-            makedirs(savedir)
-            plt.savefig(os.path.join(savedir, f"vectors.jpg"))
-            t += 1
-
 def save_trajectory(model, data_samples, savedir, ntimes=101, end_times=None, memory=0.01, device='cpu'):
     model.eval()
 
@@ -188,7 +143,7 @@ def save_trajectory(model, data_samples, savedir, ntimes=101, end_times=None, me
                     np.exp(logmag), cmap="coolwarm", scale=20., width=0.015, pivot="mid"
                 )
                 ax.set_xlim(-4, 4)
-                ax.set_ylim(4, -4)
+                ax.set_ylim(-4, 4)
                 ax.axis("off")
                 ax.set_title("Vector Field", fontsize=32)
 

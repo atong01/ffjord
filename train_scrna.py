@@ -20,10 +20,12 @@ from train_misc import create_regularization_fns, get_regularization, append_reg
 from train_misc import build_model_tabular
 
 from diagnostics.viz_scrna import save_trajectory, trajectory_to_video
+from diagnostics.viz_toy import save_vectors
 
 SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams', 'fixed_adams']
 parser = argparse.ArgumentParser('Continuous Normalizing Flow')
 parser.add_argument('--test', type=eval, default=False, choices=[True, False])
+parser.add_argument('--full_data', type=eval, default=False, choices=[True, False])
 parser.add_argument('--data', type=str, default='dummy')
 parser.add_argument(
     "--layer_type", type=str, default="concatsquash",
@@ -109,7 +111,7 @@ def load_data_full():
     transformed = scaler.transform(data.emb)
     return transformed, labels, scaler
 
-data, labels, scaler = load_data()
+data, labels, scaler = load_data_full() if args.full_data else load_data()
 timepoints = np.unique(labels)
 
 #########
@@ -358,5 +360,10 @@ if __name__ == '__main__':
     save_traj_dir = os.path.join(args.save, 'trajectory')
     logger.info('Plotting trajectory to {}'.format(save_traj_dir))
     data_samples = full_sampler()
-    save_trajectory(model, data_samples, save_traj_dir, device=device, end_times=int_tps, ntimes=101)
-    trajectory_to_video(save_traj_dir)
+    save_vectors(model, torch.tensor(inf_sampler(data[labels==0], batch_size=100)).type(torch.float32), args.save, device=device, end_times=int_tps, ntimes=100)
+    #save_trajectory(model, data_samples, save_traj_dir, device=device, end_times=int_tps, ntimes=25)
+    #trajectory_to_video(save_traj_dir)
+
+    save_traj_dir2 = os.path.join(args.save, 'trajectory_to_end')
+    save_trajectory(model, data_samples, save_traj_dir2, device=device, end_times=[int_tps[-1]], ntimes=25)
+    trajectory_to_video(save_traj_dir2)
