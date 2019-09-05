@@ -71,6 +71,7 @@ parser.add_argument('--dl2int', type=float, default=None, help="int_t ||f^T df/d
 parser.add_argument('--JFrobint', type=float, default=None, help="int_t ||df/dx||_F")
 parser.add_argument('--JdiagFrobint', type=float, default=None, help="int_t ||df_i/dx_i||_F")
 parser.add_argument('--JoffdiagFrobint', type=float, default=None, help="int_t ||df/dx - df_i/dx_i||_F")
+parser.add_argument('--vecint', type=float, default=None, help="regularize direction")
 
 parser.add_argument('--save', type=str, default='experiments/cnf')
 parser.add_argument('--viz_freq', type=int, default=100)
@@ -114,7 +115,18 @@ def load_data_full():
     transformed = scaler.transform(data.emb)
     return transformed, labels, scaler
 
-data, labels, scaler = load_data_full() if args.full_data else load_data()
+def load_circle_data():
+    data = atd.Circle_Transition_Dataset(n=10000)
+    labels = data.get_train_labels()
+    full_data = data.get_train()
+    transformed = full_data[:,:2]
+    next_states = full_data[:,2:]
+    directions = next_states - transformed
+    return transformed, labels, np.concatenate([transformed, directions], axis=1)
+
+
+data, labels, data_and_directions = load_circle_data()
+#data, labels, scaler = load_data_full() if args.full_data else load_data()
 timepoints = np.unique(labels)
 
 #########
@@ -136,6 +148,9 @@ def inf_sampler(arr, batch_size=None, noise=0.0):
 
 def train_sampler(i):
     return inf_sampler(data[labels==i], noise=0.1)
+
+def dir_train_sampler(i):
+    return inf_sampler(data_and_directions[labels==i], noise=0.)
 
 def val_sampler(i):
     return inf_sampler(data[labels==i], batch_size=args.test_batch_size)
@@ -168,7 +183,7 @@ def scatter_timepoints():
     plt.savefig('scatter.png')
     plt.close()
 
-scatter_timepoints()
+#scatter_timepoints()
 
 def get_transforms(model, integration_times):
     """
@@ -251,10 +266,29 @@ def compute_loss(args, model, growth_model):
         logps.append(logpx[:-args.batch_size])
         losses.append(-torch.mean(logpx[-args.batch_size:]))
     # weights = torch.tensor([1,1,1,1,1]).to(logpx)
-    weights = torch.tensor([5,4,3,2,1]).to(logpx)
+    weights = torch.tensor([2,1]).to(logpx)
+    #weights = torch.tensor([5,4,3,2,1]).to(logpx)
     losses = torch.stack(losses)
 
     losses = torch.mean(losses * weights)
+
+    # Direction regularization
+    if args.vecint:
+        similarity_loss = 0
+        for i, (itp, tp) in enumerate(zip(int_tps, timepoints)):
+            itp = torch.tensor(itp).type(torch.float32).to(device)
+            x = dir_train_sampler(tp)
+            x = torch.from_numpy(x).type(torch.float32).to(device)
+            y,z = torch.split(x, 2, dim=1)
+            y = y + torch.randn_like(y) * 0.1
+            # This is really hacky but I don't know a better way (alex)
+            direction = model.chain[0].odefunc.odefunc.diffeq(itp, y)
+            similarity_loss += 1 - torch.mean(F.cosine_similarity(direction, z))
+        print(similarity_loss)
+        losses += similarity_loss * args.vecint
+
+    #loss = loss + vec_reg_loss
+
 
     #growth_losses = -torch.mean(growth_logpxs)
     #alpha = torch.tensor(args.alpha).to(growth_losses)
@@ -290,6 +324,8 @@ def train(args, model, growth_model):
         if args.spectral_norm: spectral_norm_power_iteration(growth_model, 1)
 
         loss = compute_loss(args, model, growth_model)
+            
+
         #loss, loss2 = compute_loss(args, model, growth_model)
         loss_meter.update(loss.item())
 
@@ -393,8 +429,8 @@ def plot_output(args, model):
     logger.info('Plotting trajectory to {}'.format(save_traj_dir))
     data_samples = full_sampler()
     save_vectors(model, torch.tensor(inf_sampler(data[labels==0], batch_size=100)).type(torch.float32), args.save, device=device, end_times=int_tps, ntimes=100)
-    #save_trajectory(model, data_samples, save_traj_dir, device=device, end_times=int_tps, ntimes=25)
-    #trajectory_to_video(save_traj_dir)
+    save_trajectory(model, data_samples, save_traj_dir, device=device, end_times=int_tps, ntimes=25)
+    trajectory_to_video(save_traj_dir)
 
     save_traj_dir2 = os.path.join(args.save, 'trajectory_to_end')
     save_trajectory(model, data_samples, save_traj_dir2, device=device, end_times=[int_tps[-1]], ntimes=25)
@@ -427,10 +463,11 @@ if __name__ == '__main__':
 
     if args.test:
         model.load_state_dict(torch.load(args.save + '/checkpt.pth')['state_dict'])
-        growth_model.load_state_dict(torch.load(args.save + '/checkpt.pth')['growth_state_dict'])
+        #growth_model.load_state_dict(torch.load(args.save + '/checkpt.pth')['growth_state_dict'])
     else:
         train(args, model, growth_model)
 
-    plot_output(args, model, growth_model)
+    plot_output(args, model)
+    #plot_output(args, model, growth_model)
 
 
