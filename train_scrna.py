@@ -21,7 +21,7 @@ from train_misc import add_spectral_norm, spectral_norm_power_iteration
 from train_misc import create_regularization_fns, get_regularization, append_regularization_to_log
 from train_misc import build_model_tabular
 
-from diagnostics.viz_scrna import save_trajectory, trajectory_to_video
+from diagnostics.viz_scrna import save_trajectory, trajectory_to_video, save_trajectory_density
 from diagnostics.viz_toy import save_vectors
 
 SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams', 'fixed_adams']
@@ -125,8 +125,8 @@ def load_circle_data():
     return transformed, labels, np.concatenate([transformed, directions], axis=1)
 
 
-data, labels, data_and_directions = load_circle_data()
-#data, labels, scaler = load_data_full() if args.full_data else load_data()
+#data, labels, data_and_directions = load_circle_data()
+data, labels, scaler = load_data_full() if args.full_data else load_data()
 timepoints = np.unique(labels)
 
 #########
@@ -233,7 +233,7 @@ def compute_loss(args, model, growth_model):
     # Backward pass accumulating losses, previous state and deltas
     deltas = []
     xs = []
-    #prev_xs = []
+    prev_xs = []
     for i, (itp, tp) in enumerate(zip(int_tps[::-1], timepoints[::-1])): # tp counts down from last
         integration_times = torch.tensor([itp-args.time_length, itp]).type(torch.float32).to(device)
 
@@ -247,7 +247,7 @@ def compute_loss(args, model, growth_model):
 
         # transform to previous timepoint
         z, delta_logp = model(x, zero, integration_times=integration_times)
-        #prev_xs.append(z[-args.batch_size:])
+        prev_xs.append(z[-args.batch_size:])
         deltas.append(delta_logp)
 
     # compute log growth probability
@@ -260,14 +260,20 @@ def compute_loss(args, model, growth_model):
     # compute log q(z) with forward pass
     logpz = standard_normal_logprob(z).sum(1, keepdim=True)
     logps = [logpz]
+    
+    # build growth rates
+    log_growthrates = [torch.zeros_like(logpz)]
+    for x_state in prev_xs[::-1]:
+        log_growthrates.append(growth_model(x_state))
+
     losses = []
     for delta_logp in deltas[::-1]:
         logpx = logps[-1] - delta_logp
         logps.append(logpx[:-args.batch_size])
-        losses.append(-torch.mean(logpx[-args.batch_size:]))
+        losses.append(-torch.mean(logpx[-args.batch_size:] + torch.log(log_growthrates[-1])))
     # weights = torch.tensor([1,1,1,1,1]).to(logpx)
-    weights = torch.tensor([2,1]).to(logpx)
-    #weights = torch.tensor([5,4,3,2,1]).to(logpx)
+    #weights = torch.tensor([2,1]).to(logpx)
+    weights = torch.tensor([5,4,3,2,1]).to(logpx)
     losses = torch.stack(losses)
 
     losses = torch.mean(losses * weights)
@@ -321,12 +327,12 @@ def train(args, model, growth_model):
 
         ### Train
         if args.spectral_norm: spectral_norm_power_iteration(model, 1)
-        if args.spectral_norm: spectral_norm_power_iteration(growth_model, 1)
+        #if args.spectral_norm: spectral_norm_power_iteration(growth_model, 1)
 
-        loss = compute_loss(args, model, growth_model)
+        #loss = compute_loss(args, model, growth_model)
             
 
-        #loss, loss2 = compute_loss(args, model, growth_model)
+        loss = compute_loss(args, model, growth_model)
         loss_meter.update(loss.item())
 
         if len(regularization_coeffs) > 0:
@@ -337,12 +343,12 @@ def train(args, model, growth_model):
             )
             loss = loss + reg_loss
 
-        if len(growth_regularization_coeffs) > 0:
-            growth_reg_states = get_regularization(growth_model, growth_regularization_coeffs)
-            reg_loss = sum(
-                reg_state * coeff for reg_state, coeff in zip(growth_reg_states, growth_regularization_coeffs) if coeff != 0
-            )
-            loss2 = loss2 + reg_loss
+        #if len(growth_regularization_coeffs) > 0:
+        #    growth_reg_states = get_regularization(growth_model, growth_regularization_coeffs)
+        #    reg_loss = sum(
+        #        reg_state * coeff for reg_state, coeff in zip(growth_reg_states, growth_regularization_coeffs) if coeff != 0
+        #    )
+        #    loss2 = loss2 + reg_loss
 
         total_time = count_total_time(model)
         nfe_forward = count_nfe(model)
@@ -428,13 +434,17 @@ def plot_output(args, model):
     save_traj_dir = os.path.join(args.save, 'trajectory')
     logger.info('Plotting trajectory to {}'.format(save_traj_dir))
     data_samples = full_sampler()
-    save_vectors(model, torch.tensor(inf_sampler(data[labels==0], batch_size=100)).type(torch.float32), args.save, device=device, end_times=int_tps, ntimes=100)
-    save_trajectory(model, data_samples, save_traj_dir, device=device, end_times=int_tps, ntimes=25)
-    trajectory_to_video(save_traj_dir)
+    #save_vectors(model, torch.tensor(inf_sampler(data[labels==0], batch_size=100)).type(torch.float32), args.save, device=device, end_times=int_tps, ntimes=100)
+    #save_trajectory(model, data_samples, save_traj_dir, device=device, end_times=int_tps, ntimes=25)
+    #trajectory_to_video(save_traj_dir)
 
-    save_traj_dir2 = os.path.join(args.save, 'trajectory_to_end')
-    save_trajectory(model, data_samples, save_traj_dir2, device=device, end_times=[int_tps[-1]], ntimes=25)
-    trajectory_to_video(save_traj_dir2)
+    density_dir = os.path.join(args.save, 'density2')
+    save_trajectory_density(model, data_samples, density_dir, device=device, end_times=int_tps, ntimes=100, memory=0.1)
+    trajectory_to_video(density_dir)
+
+    #save_traj_dir2 = os.path.join(args.save, 'trajectory_to_end')
+    #save_trajectory(model, data_samples, save_traj_dir2, device=device, end_times=[int_tps[-1]], ntimes=25)
+    #trajectory_to_video(save_traj_dir2)
 
 class GrowthNet(nn.Module):
     def __init__(self):
@@ -442,24 +452,24 @@ class GrowthNet(nn.Module):
 
         self.fc1 = nn.Linear(2,64)
         self.fc2 = nn.Linear(64,64)
-        self.fc3 = nn.Linear(64,2)
+        self.fc3 = nn.Linear(64,1)
 
     def forward(self, x):
-        x = F.tanh(self.fc1(x))
-        x = F.tanh(self.fc2(x))
-        x = self.fc3(x)
+        x = F.leaky_relu(self.fc1(x))
+        x = F.leaky_relu(self.fc2(x))
+        x = F.tanh(self.fc3(x)) + 1
         return x
 
 if __name__ == '__main__':
     regularization_fns, regularization_coeffs = create_regularization_fns(args)
     growth_regularization_fns, growth_regularization_coeffs = create_regularization_fns(args)
     model = build_model_tabular(args, 2, regularization_fns).to(device)
-    #growth_model = GrowthNet().to(device)
-    growth_model = build_model_tabular(args, 2, growth_regularization_fns).to(device)
+    growth_model = GrowthNet().to(device)
+    #growth_model = build_model_tabular(args, 2, growth_regularization_fns).to(device)
     if args.spectral_norm: add_spectral_norm(model)
-    if args.spectral_norm: add_spectral_norm(growth_model)
+    #if args.spectral_norm: add_spectral_norm(growth_model)
     set_cnf_options(args, model)
-    set_cnf_options(args, growth_model)
+    #set_cnf_options(args, growth_model)
 
     if args.test:
         model.load_state_dict(torch.load(args.save + '/checkpt.pth')['state_dict'])

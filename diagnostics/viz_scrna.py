@@ -16,6 +16,93 @@ def makedirs(dirname):
     if not os.path.exists(dirname):
         os.makedirs(dirname)
 
+def save_trajectory_density(model, data_samples, savedir, ntimes=101, end_times=None, memory=0.01, device='cpu'):
+    model.eval()
+
+    # sample from a grid
+    #Jnpts = 100
+    npts = 800
+    side = np.linspace(-4, 4, npts)
+    xx, yy = np.meshgrid(side, side)
+    xx = torch.from_numpy(xx).type(torch.float32).to(device)
+    yy = torch.from_numpy(yy).type(torch.float32).to(device)
+    z_grid = torch.cat([xx.reshape(-1, 1), yy.reshape(-1, 1)], 1)
+
+    with torch.no_grad():
+        # We expect the model is a chain of CNF layers wrapped in a SequentialFlow container.
+        logp_grid = torch.sum(standard_normal_logprob(z_grid), 1, keepdim=True)
+        t = 0
+        for cnf in model.chain:
+            # Construct integration_list
+            if end_times is None:
+                end_times = [(cnf.sqrt_end_time * cnf.sqrt_end_time)]
+            integration_list = [torch.linspace(0, end_times[0], ntimes).to(device)]
+            for i, et in enumerate(end_times[1:]):
+                integration_list.append(torch.linspace(end_times[i], et, ntimes).to(device))
+            full_times = torch.cat(integration_list, 0)
+
+            grid_z_traj, grid_logpz_traj = [], []
+            inds = torch.arange(0, z_grid.shape[0]).to(torch.int64)
+            for ii in torch.split(inds, int(z_grid.shape[0] * memory)):
+                _grid_z_traj, _grid_logpz_traj = cnf(
+                    z_grid[ii], logp_grid[ii], integration_times=integration_list[0], reverse=True
+                )
+                full_traj = [(_grid_z_traj, _grid_logpz_traj)]
+                for int_times in integration_list[1:]:
+                    prev_z, prev_logp = full_traj[-1]
+                    _grid_z_traj, _grid_logpz_traj = cnf(
+                        prev_z[-1], prev_logp[-1], integration_times=int_times, reverse=True
+                    )
+                    full_traj.append((_grid_z_traj, _grid_logpz_traj))
+                full_zip = list(zip(*full_traj))
+                _grid_z_traj = torch.cat(full_zip[0], 0).cpu().numpy()
+                _grid_logpz_traj = torch.cat(full_zip[1], 0).cpu().numpy()
+                print(_grid_z_traj.shape)
+                grid_z_traj.append(_grid_z_traj)
+                grid_logpz_traj.append(_grid_logpz_traj)
+                
+            grid_z_traj = np.concatenate(grid_z_traj, axis=1)[ntimes:]
+            grid_logpz_traj = np.concatenate(grid_logpz_traj, axis=1)[ntimes:]
+            
+
+            #plt.figure(figsize=(8, 8))
+            #fig, axes = plt.subplots(2,1, gridspec_kw={'height_ratios': [7, 1]}, figsize=(5,7))
+            for _ in range(grid_z_traj.shape[0]):
+                fig, axes = plt.subplots(2,1, gridspec_kw={'height_ratios': [7, 1]}, figsize=(8,8))
+                #plt.clf()
+                ax = axes[0]
+                # Density
+                z, logqz = grid_z_traj[t], grid_logpz_traj[t]
+
+                xx = z[:, 0].reshape(npts, npts)
+                yy = z[:, 1].reshape(npts, npts)
+                qz = np.exp(logqz).reshape(npts, npts)
+
+                ax.pcolormesh(xx, yy, qz)
+                ax.set_xlim(-4, 4)
+                ax.set_ylim(-4, 4)
+                cmap = matplotlib.cm.get_cmap(None)
+                ax.set_facecolor(cmap(0.))
+                #ax.invert_yaxis()
+                ax.get_xaxis().set_ticks([])
+                ax.get_yaxis().set_ticks([])
+                ax.set_title("Density", fontsize=32)
+
+                ax=axes[1]
+
+                # Colorbar
+                cb = matplotlib.colorbar.ColorbarBase(ax, cmap='Spectral', orientation='horizontal')
+                cb.set_ticks(np.linspace(0,1,5))
+                cb.set_ticklabels(np.arange(5))
+                ax.axvline(t / grid_z_traj.shape[0], c='k', linewidth=15)
+                ax.set_title('Time')
+
+                print('making dir: %s' % savedir)
+                makedirs(savedir)
+                plt.savefig(os.path.join(savedir, f"viz-{t:05d}.jpg"))
+                plt.close()
+                t += 1
+
 
 def save_trajectory(model, data_samples, savedir, ntimes=101, end_times=None, memory=0.01, device='cpu'):
     model.eval()
