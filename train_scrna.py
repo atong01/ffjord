@@ -12,7 +12,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 import lib.utils as utils
-from lib.visualize_flow import visualize_transform
+from lib.visualize_flow import visualize_transform, visualize_growth
+
 import lib.layers.odefunc as odefunc
 
 from train_misc import standard_normal_logprob, uniform_logprob
@@ -21,8 +22,7 @@ from train_misc import add_spectral_norm, spectral_norm_power_iteration
 from train_misc import create_regularization_fns, get_regularization, append_regularization_to_log
 from train_misc import build_model_tabular
 
-from diagnostics.viz_scrna import save_trajectory, trajectory_to_video, save_trajectory_density
-from diagnostics.viz_toy import save_vectors
+from diagnostics.viz_scrna import save_trajectory, trajectory_to_video, save_trajectory_density, save_vectors
 
 SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams', 'fixed_adams']
 parser = argparse.ArgumentParser('Continuous Normalizing Flow')
@@ -75,6 +75,7 @@ parser.add_argument('--vecint', type=float, default=None, help="regularize direc
 
 parser.add_argument('--save', type=str, default='experiments/cnf')
 parser.add_argument('--viz_freq', type=int, default=100)
+parser.add_argument('--viz_freq_growth', type=int, default=100)
 parser.add_argument('--val_freq', type=int, default=100)
 parser.add_argument('--log_freq', type=int, default=10)
 parser.add_argument('--gpu', type=int, default=0)
@@ -233,7 +234,7 @@ def compute_loss(args, model, growth_model):
     # Backward pass accumulating losses, previous state and deltas
     deltas = []
     xs = []
-    prev_xs = []
+    zs = []
     for i, (itp, tp) in enumerate(zip(int_tps[::-1], timepoints[::-1])): # tp counts down from last
         integration_times = torch.tensor([itp-args.time_length, itp]).type(torch.float32).to(device)
 
@@ -243,11 +244,11 @@ def compute_loss(args, model, growth_model):
         xs.append(x)
         if i > 0:
             x = torch.cat((z, x))
+            zs.append(z)
         zero = torch.zeros(x.shape[0], 1).to(x)
 
         # transform to previous timepoint
         z, delta_logp = model(x, zero, integration_times=integration_times)
-        prev_xs.append(z[-args.batch_size:])
         deltas.append(delta_logp)
 
     # compute log growth probability
@@ -262,21 +263,30 @@ def compute_loss(args, model, growth_model):
     logps = [logpz]
     
     # build growth rates
-    log_growthrates = [torch.zeros_like(logpz)]
-    for x_state in prev_xs[::-1]:
-        log_growthrates.append(growth_model(x_state))
+    growthrates = [torch.ones_like(logpz)]
+    for z_state in zs[::-1]:
+        growthrates.append(growth_model(z_state))
 
     losses = []
-    for delta_logp in deltas[::-1]:
-        logpx = logps[-1] - delta_logp
+    for gr, delta_logp in zip(growthrates, deltas[::-1]):
+        logpx = logps[-1] - delta_logp + torch.log(gr)
         logps.append(logpx[:-args.batch_size])
-        losses.append(-torch.mean(logpx[-args.batch_size:] + torch.log(log_growthrates[-1])))
+        losses.append(-torch.mean(logpx[-args.batch_size:]))
     # weights = torch.tensor([1,1,1,1,1]).to(logpx)
     #weights = torch.tensor([2,1]).to(logpx)
     weights = torch.tensor([5,4,3,2,1]).to(logpx)
     losses = torch.stack(losses)
-
     losses = torch.mean(losses * weights)
+
+    # Add a hinge loss on the growth model so that we prefer sums over the batch
+    # to be not too much more than 1 on average
+    reg = 0.
+    for gr in growthrates[1:]:
+        reg += F.relu(torch.mean(gr[-1000:]) - 1) # Only put a loss on the last portion with real data
+    #mean_growthrate = torch.mean(torch.cat(growthrates[1:]))
+    #reg = F.relu(mean_growthrate - 1)
+    print(reg.item())
+    losses += 5*reg
 
     # Direction regularization
     if args.vecint:
@@ -285,11 +295,11 @@ def compute_loss(args, model, growth_model):
             itp = torch.tensor(itp).type(torch.float32).to(device)
             x = dir_train_sampler(tp)
             x = torch.from_numpy(x).type(torch.float32).to(device)
-            y,z = torch.split(x, 2, dim=1)
+            y,zz = torch.split(x, 2, dim=1)
             y = y + torch.randn_like(y) * 0.1
             # This is really hacky but I don't know a better way (alex)
             direction = model.chain[0].odefunc.odefunc.diffeq(itp, y)
-            similarity_loss += 1 - torch.mean(F.cosine_similarity(direction, z))
+            similarity_loss += 1 - torch.mean(F.cosine_similarity(direction, zz))
         print(similarity_loss)
         losses += similarity_loss * args.vecint
 
@@ -393,6 +403,7 @@ def train(args, model, growth_model):
                     torch.save({
                         'args': args,
                         'state_dict': model.state_dict(),
+                        'growth_state_dict': growth_model.state_dict(),
                     }, os.path.join(args.save, 'checkpt.pth'))
                 model.train()
 
@@ -406,14 +417,13 @@ def train(args, model, growth_model):
                     plt.figure(figsize=(9, 3))
                     visualize_transform(
                         p_samples, torch.randn, standard_normal_logprob, transform=sample_fn, inverse_transform=density_fn,
-                        samples=True, npts=800, device=device
+                        samples=True, npts=100, device=device
                     )
                     fig_filename = os.path.join(args.save, 'figs', '{:04d}_{:01d}.jpg'.format(itr, i))
                     utils.makedirs(os.path.dirname(fig_filename))
                     plt.savefig(fig_filename)
                     plt.close()
 
-                    # Visualize growth transform
                     #visualize_transform(
                     #    p_samples, torch.rand, uniform_logprob, transform=growth_sample_fn, 
                     #    inverse_transform=growth_density_fn,
@@ -424,23 +434,43 @@ def train(args, model, growth_model):
                     #utils.makedirs(os.path.dirname(fig_filename))
                     #plt.savefig(fig_filename)
                     #plt.close()
-
                 model.train()
+
+        if itr % args.viz_freq_growth == 0:
+            with torch.no_grad():
+                growth_model.eval()
+                # Visualize growth transform
+                growth_filename = os.path.join(args.save, 'growth', '{:04d}.jpg'.format(itr))
+                utils.makedirs(os.path.dirname(growth_filename))
+                visualize_growth(growth_model, data, labels, npts=200, device=device)
+                plt.savefig(growth_filename)
+                plt.close()
+                growth_model.train()
+
         end = time.time()
     logger.info('Training has finished.')
 
 
-def plot_output(args, model):
+def plot_output(args, model, growth_model=None):
     save_traj_dir = os.path.join(args.save, 'trajectory')
     logger.info('Plotting trajectory to {}'.format(save_traj_dir))
     data_samples = full_sampler()
-    #save_vectors(model, torch.tensor(inf_sampler(data[labels==0], batch_size=100)).type(torch.float32), args.save, device=device, end_times=int_tps, ntimes=100)
+    save_vectors(model, torch.tensor(inf_sampler(data[labels==0], batch_size=50)).type(torch.float32), data, labels,
+                 args.save, device=device, end_times=int_tps, ntimes=100)
     #save_trajectory(model, data_samples, save_traj_dir, device=device, end_times=int_tps, ntimes=25)
     #trajectory_to_video(save_traj_dir)
 
-    density_dir = os.path.join(args.save, 'density2')
-    save_trajectory_density(model, data_samples, density_dir, device=device, end_times=int_tps, ntimes=100, memory=0.1)
-    trajectory_to_video(density_dir)
+    #density_dir = os.path.join(args.save, 'density2')
+    #save_trajectory_density(model, data_samples, density_dir, device=device, end_times=int_tps, ntimes=100, memory=0.1)
+    #trajectory_to_video(density_dir)
+
+    if growth_model is not None:
+        print('Plotting growth model')
+        growth_filename = os.path.join(args.save, 'growth.jpg')
+        utils.makedirs(os.path.dirname(growth_filename))
+        visualize_growth(growth_model, data, labels, npts=200, device=device)
+        plt.savefig(growth_filename)
+        plt.close()
 
     #save_traj_dir2 = os.path.join(args.save, 'trajectory_to_end')
     #save_trajectory(model, data_samples, save_traj_dir2, device=device, end_times=[int_tps[-1]], ntimes=25)
@@ -472,12 +502,17 @@ if __name__ == '__main__':
     #set_cnf_options(args, growth_model)
 
     if args.test:
-        model.load_state_dict(torch.load(args.save + '/checkpt.pth')['state_dict'])
-        #growth_model.load_state_dict(torch.load(args.save + '/checkpt.pth')['growth_state_dict'])
+        state_dict = torch.load(args.save + '/checkpt.pth')
+        model.load_state_dict(state_dict['state_dict'])
+        if 'growth_state_dict' not in state_dict:
+            print('error growth model note in save')
+            growth_model = None
+        else:
+            growth_model.load_state_dict(torch.load(args.save + '/checkpt.pth')['growth_state_dict'])
     else:
         train(args, model, growth_model)
 
-    plot_output(args, model)
+    plot_output(args, model, growth_model)
     #plot_output(args, model, growth_model)
 
 
