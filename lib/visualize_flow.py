@@ -108,6 +108,25 @@ def plt_samples(samples, ax, npts=100, title="$x ~ p(x)$"):
     ax.get_yaxis().set_ticks([])
     ax.set_title(title)
 
+def visualize_growth(growth_model, full_data, labels, npts=200, memory=100, device='cpu'):
+    with torch.no_grad():
+        fig, ax = plt.subplots(1,1)
+        side = np.linspace(LOW, HIGH, npts)
+        xx, yy = np.meshgrid(side, side)
+        x = np.hstack([xx.reshape(-1, 1), yy.reshape(-1, 1)])
+        x = torch.from_numpy(x).type(torch.float32).to(device)
+        output_growth = growth_model(x).cpu().numpy()
+        output_growth = np.reshape(output_growth, (npts, npts))
+        im = ax.imshow(output_growth, cmap = 'bwr')
+        ax.get_xaxis().set_ticks([])
+        ax.get_yaxis().set_ticks([])
+        fig.colorbar(im, ax=ax)
+        ax.set_title('Growth Rate')
+        
+        # rescale full data to image coordinates
+        full_data = full_data * npts / 8 + npts / 2
+        ax.scatter(full_data[:,0], full_data[:,1], c=labels / 5, cmap='Spectral', s=10,alpha=0.5)
+
 
 def visualize_transform(
     potential_or_samples, prior_sample, prior_density, transform=None, inverse_transform=None, samples=True, npts=100,
