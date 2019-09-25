@@ -118,6 +118,7 @@ REGULARIZATION_FNS = {
     "l1int": reg_lib.l1_regularzation_fn,
     "l2int": reg_lib.l2_regularzation_fn,
     "dl2int": reg_lib.directional_l2_regularization_fn,
+    "dtl2int": reg_lib.directional_l2_change_penalty_fn,
     "JFrobint": reg_lib.jacobian_frobenius_regularization_fn,
     "JdiagFrobint": reg_lib.jacobian_diag_frobenius_regularization_fn,
     "JoffdiagFrobint": reg_lib.jacobian_offdiag_frobenius_regularization_fn,

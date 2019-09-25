@@ -22,7 +22,7 @@ class RegularizedODEfunc(nn.Module):
             dstate = self.odefunc(t, (x, logp))
             if len(state) > 2:
                 dx, dlogp = dstate[:2]
-                reg_states = tuple(reg_fn(x, logp, dx, dlogp, SharedContext) for reg_fn in self.regularization_fns)
+                reg_states = tuple(reg_fn(x, logp, dx, dlogp, t, SharedContext) for reg_fn in self.regularization_fns)
                 return dstate + reg_states
             else:
                 return dstate
@@ -37,23 +37,32 @@ def _batch_root_mean_squared(tensor):
     return torch.mean(torch.norm(tensor, p=2, dim=1) / tensor.shape[1]**0.5)
 
 
-def l1_regularzation_fn(x, logp, dx, dlogp, unused_context):
+def l1_regularzation_fn(x, logp, dx, dlogp, t, unused_context):
     del x, logp, dlogp
     return torch.mean(torch.abs(dx))
 
 
-def l2_regularzation_fn(x, logp, dx, dlogp, unused_context):
+def l2_regularzation_fn(x, logp, dx, dlogp, t, unused_context):
     del x, logp, dlogp
     return _batch_root_mean_squared(dx)
 
 
-def directional_l2_regularization_fn(x, logp, dx, dlogp, unused_context):
+def directional_l2_regularization_fn(x, logp, dx, dlogp, t, unused_context):
     del logp, dlogp
     directional_dx = torch.autograd.grad(dx, x, dx, create_graph=True)[0]
     return _batch_root_mean_squared(directional_dx)
 
+def directional_l2_change_penalty_fn(x, logp, dx, dlogp, t, unused_context):
+    del logp, dlogp
+    #tt = torch.ones(dx.shape[0], 1) * t
+    # f(y(t), t) * df / dy + df / dt
+    # For now we ignore the directional dx penalty as this complicates things
+    #directional_dx = torch.autograd.grad(dx, x, dx, create_graph=True)[0]
+    dfdt = _get_minibatch_jacobian(dx, t, create_graph=True)
+    #dfdt_full = dfdt + directional_dx
+    return _batch_root_mean_squared(dfdt)
 
-def jacobian_frobenius_regularization_fn(x, logp, dx, dlogp, context):
+def jacobian_frobenius_regularization_fn(x, logp, dx, dlogp, t, context):
     del logp, dlogp
     if hasattr(context, "jac"):
         jac = context.jac
@@ -63,7 +72,7 @@ def jacobian_frobenius_regularization_fn(x, logp, dx, dlogp, context):
     return _batch_root_mean_squared(jac)
 
 
-def jacobian_diag_frobenius_regularization_fn(x, logp, dx, dlogp, context):
+def jacobian_diag_frobenius_regularization_fn(x, logp, dx, dlogp, t, context):
     del logp, dlogp
     if hasattr(context, "jac"):
         jac = context.jac
@@ -74,7 +83,7 @@ def jacobian_diag_frobenius_regularization_fn(x, logp, dx, dlogp, context):
     return _batch_root_mean_squared(diagonal)
 
 
-def jacobian_offdiag_frobenius_regularization_fn(x, logp, dx, dlogp, context):
+def jacobian_offdiag_frobenius_regularization_fn(x, logp, dx, dlogp, t, context):
     del logp, dlogp
     if hasattr(context, "jac"):
         jac = context.jac
@@ -96,14 +105,25 @@ def _get_minibatch_jacobian(y, x, create_graph=False):
     Returns:
       The minibatch Jacobian matrix of shape (N, D_y, D_x)
     """
-    assert y.shape[0] == x.shape[0]
+    #assert y.shape[0] == x.shape[0]
     y = y.view(y.shape[0], -1)
 
     # Compute Jacobian row by row.
     jac = []
     for j in range(y.shape[1]):
         dy_j_dx = torch.autograd.grad(y[:, j], x, torch.ones_like(y[:, j]), retain_graph=True,
-                                      create_graph=True)[0].view(x.shape[0], -1)
-        jac.append(torch.unsqueeze(dy_j_dx, 1))
-    jac = torch.cat(jac, 1)
+                                      create_graph=create_graph)[0]
+        jac.append(torch.unsqueeze(dy_j_dx, -1))
+    jac = torch.cat(jac, -1)
+    return jac
+
+def _get_minibatch_jacobian_wrt_scalar(y, x, create_graph=False):
+    assert len(x.shape) == 0
+    y = y.view(y.shape[0], -1)
+    jac = []
+    for i in range(y.shape[0]):
+        for j in range(y.shape[1]):
+            dy_ij_dx = torch.autograd.grad(y[i,j], x, retain_graph=True, create_graph=create_graph)[0]
+            jac.append(torch.unsqueeze(dy_ij_dx, -1))
+    jac = torch.reshape(torch.cat(jac), y.shape)
     return jac

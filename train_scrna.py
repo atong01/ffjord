@@ -67,7 +67,8 @@ parser.add_argument('--weight_decay', type=float, default=1e-5)
 # Track quantities
 parser.add_argument('--l1int', type=float, default=None, help="int_t ||f||_1")
 parser.add_argument('--l2int', type=float, default=None, help="int_t ||f||_2")
-parser.add_argument('--dl2int', type=float, default=None, help="int_t ||f^T df/dt||_2")
+parser.add_argument('--dl2int', type=float, default=None, help="int_t ||f^T df/dt||_2") # f df/dx???
+parser.add_argument('--dtl2int', type=float, default=None, help="int_t ||f^T df/dx + df/dt||_2")
 parser.add_argument('--JFrobint', type=float, default=None, help="int_t ||df/dx||_F")
 parser.add_argument('--JdiagFrobint', type=float, default=None, help="int_t ||df_i/dx_i||_F")
 parser.add_argument('--JoffdiagFrobint', type=float, default=None, help="int_t ||df/dx - df_i/dx_i||_F")
@@ -125,9 +126,46 @@ def load_circle_data():
     directions = next_states - transformed
     return transformed, labels, np.concatenate([transformed, directions], axis=1)
 
+def load_gaussian_pair_data():
+    n, d = 10000, 2
+    scale = 1 / 5
+    #a= [np.ones(n // 2, d) * -1, np.ones(n // 2, d)]
+    y = np.concatenate([np.zeros(n // 2), np.ones(n // 2)], axis=0)
+    y_full = np.stack([y, np.zeros_like(y)], axis=1)
+    x = np.stack([y + scale * np.random.randn(n), scale * np.random.randn(n)], axis=1)
+    return x, y, None
 
+def load_gaussian_curve_path():
+    n, d = 15000, 2
+    n = (n // 3) * 3 # Round N
+    scale = 1
+    #centers = [[1,0], [1,1], [1,2]]
+    y = np.repeat([0, 0.5, 2], repeats=n//3, axis=0)
+    y_full = np.stack([np.zeros_like(y), y], axis=1)
+    x = y_full + scale * np.random.randn(n, d)
+    return x, y, None
+
+def load_gaussian_data():
+    n = 10000
+    mean = 3
+    x = np.random.randn(n,2) + mean * np.stack([np.ones(n), np.zeros(n)], axis=1)
+    return x, np.zeros(n), None
+
+data, labels, _ = load_gaussian_curve_path()
+#data, labels, _ = load_gaussian_pair_data()
+
+import scprep
+print(data.shape, labels.shape)
+fig, ax = plt.subplots(1,1)
+scprep.plot.scatter2d(data, c=labels, ax=ax)
+#scprep.plot.scatter2d(np.random.randn(10000,2), ax=ax)
+ax.set_aspect('equal')
+plt.savefig('gaussians.png')
+plt.close()
+
+exit()
 #data, labels, data_and_directions = load_circle_data()
-data, labels, scaler = load_data_full() if args.full_data else load_data()
+#data, labels, scaler = load_data_full() if args.full_data else load_data()
 timepoints = np.unique(labels)
 
 #########
@@ -135,7 +173,8 @@ timepoints = np.unique(labels)
 #timepoints = timepoints[:2]
 
 # Integration timepoints, where to evaluate the ODE
-int_tps = (timepoints+1) * args.time_length
+#int_tps = (timepoints+1) * args.time_length
+int_tps = (np.arange(len(timepoints))+1.) * args.time_length
 
 #########
 
@@ -148,16 +187,16 @@ def inf_sampler(arr, batch_size=None, noise=0.0):
     return samples
 
 def train_sampler(i):
-    return inf_sampler(data[labels==i], noise=0.1)
+    return inf_sampler(data[labels==i, :], noise=0.1)
 
 def dir_train_sampler(i):
     return inf_sampler(data_and_directions[labels==i], noise=0.)
 
 def val_sampler(i):
-    return inf_sampler(data[labels==i], batch_size=args.test_batch_size)
+    return inf_sampler(data[labels==i, :], batch_size=args.test_batch_size)
 
 def viz_sampler(i):
-    return inf_sampler(data[labels==i], batch_size=args.viz_batch_size)
+    return inf_sampler(data[labels==i, :], batch_size=args.viz_batch_size)
 
 full_sampler = lambda: inf_sampler(data, 2000)
 
@@ -263,30 +302,35 @@ def compute_loss(args, model, growth_model):
     logps = [logpz]
     
     # build growth rates
-    growthrates = [torch.ones_like(logpz)]
+    growthrates = [torch.zeros_like(logpz)]
+    #growthrates = [torch.ones_like(logpz)]
     for z_state in zs[::-1]:
         growthrates.append(growth_model(z_state))
 
     losses = []
     for gr, delta_logp in zip(growthrates, deltas[::-1]):
-        logpx = logps[-1] - delta_logp + torch.log(gr)
+        logpx = logps[-1] - delta_logp# + gr
+        #logpx = logps[-1] - delta_logp + torch.log(gr)
         logps.append(logpx[:-args.batch_size])
         losses.append(-torch.mean(logpx[-args.batch_size:]))
-    # weights = torch.tensor([1,1,1,1,1]).to(logpx)
+    weights = torch.tensor([1,1,10]).to(logpx)
     #weights = torch.tensor([2,1]).to(logpx)
-    weights = torch.tensor([5,4,3,2,1]).to(logpx)
     losses = torch.stack(losses)
+    #weights = torch.ones_like(losses).to(logpx)
     losses = torch.mean(losses * weights)
+    #losses = torch.mean(losses)
 
     # Add a hinge loss on the growth model so that we prefer sums over the batch
     # to be not too much more than 1 on average
     reg = 0.
     for gr in growthrates[1:]:
-        reg += F.relu(torch.mean(gr[-1000:]) - 1) # Only put a loss on the last portion with real data
+        reg += F.relu(torch.mean(gr[-1000:])) # Only put a loss on the last portion with real data
+        #reg += F.relu(torch.mean(gr[-1000:]) - 1) # Only put a loss on the last portion with real data
     #mean_growthrate = torch.mean(torch.cat(growthrates[1:]))
     #reg = F.relu(mean_growthrate - 1)
-    print(reg.item())
-    losses += 5*reg
+    #print(reg.item())
+    #losses += 3*reg
+    #losses += 0.001 * torch.mean(gr[-1000:] ** 2)
 
     # Direction regularization
     if args.vecint:
@@ -410,8 +454,8 @@ def train(args, model, growth_model):
         if itr % args.viz_freq == 0:
             with torch.no_grad():
                 model.eval()
-                for i, _ in enumerate(timepoints):
-                    p_samples = viz_sampler(i)
+                for i, tp in enumerate(timepoints):
+                    p_samples = viz_sampler(tp)
                     sample_fn, density_fn = get_transforms(model, int_tps[:i+1])
                     #growth_sample_fn, growth_density_fn = get_transforms(growth_model, int_tps[:i+1])
                     plt.figure(figsize=(9, 3))
@@ -457,8 +501,8 @@ def plot_output(args, model, growth_model=None):
     data_samples = full_sampler()
     save_vectors(model, torch.tensor(inf_sampler(data[labels==0], batch_size=50)).type(torch.float32), data, labels,
                  args.save, device=device, end_times=int_tps, ntimes=100)
-    #save_trajectory(model, data_samples, save_traj_dir, device=device, end_times=int_tps, ntimes=25)
-    #trajectory_to_video(save_traj_dir)
+    save_trajectory(model, data_samples, save_traj_dir, device=device, end_times=int_tps, ntimes=25)
+    trajectory_to_video(save_traj_dir)
 
     #density_dir = os.path.join(args.save, 'density2')
     #save_trajectory_density(model, data_samples, density_dir, device=device, end_times=int_tps, ntimes=100, memory=0.1)
@@ -487,7 +531,8 @@ class GrowthNet(nn.Module):
     def forward(self, x):
         x = F.leaky_relu(self.fc1(x))
         x = F.leaky_relu(self.fc2(x))
-        x = F.tanh(self.fc3(x)) + 1
+        x = self.fc3(x)
+        #x = F.tanh(self.fc3(x)) + 1
         return x
 
 if __name__ == '__main__':

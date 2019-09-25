@@ -125,7 +125,7 @@ def visualize_growth(growth_model, full_data, labels, npts=200, memory=100, devi
         
         # rescale full data to image coordinates
         full_data = full_data * npts / 8 + npts / 2
-        ax.scatter(full_data[:,0], full_data[:,1], c=labels / 5, cmap='Spectral', s=10,alpha=0.5)
+        #ax.scatter(full_data[:,0], full_data[:,1], c=labels / 5, cmap='Spectral', s=10,alpha=0.5)
 
 
 def visualize_transform(

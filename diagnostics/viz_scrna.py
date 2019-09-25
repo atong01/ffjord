@@ -36,7 +36,8 @@ def save_vectors(model, data_samples, full_data, labels, savedir, ntimes=101, en
             # Start integration at first end_time
             for i, et in enumerate(end_times[1:]):
                 integration_list.append(torch.linspace(end_times[i], et, ntimes).to(device))
-            full_times = torch.cat(integration_list, 0)
+            if len(end_times) == 1:
+                integration_list = [torch.linspace(0, end_times[0], ntimes).to(device)]
 
             # Integrate over evenly spaced samples
             z_traj, logpz = cnf(z_samples, logp_samples, integration_times=integration_list[0], reverse=True)
@@ -276,7 +277,8 @@ def save_trajectory(model, data_samples, savedir, ntimes=101, end_times=None, me
                     np.exp(logmag), cmap="coolwarm", scale=20., width=0.015, pivot="mid"
                 )
                 ax.set_xlim(-4, 4)
-                ax.set_ylim(-4, 4)
+                ax.set_ylim(4, -4)
+                #ax.set_ylim(-4, 4)
                 ax.axis("off")
                 ax.set_title("Vector Field", fontsize=32)
 
