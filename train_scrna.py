@@ -16,7 +16,7 @@ from lib.visualize_flow import visualize_transform, visualize_growth
 
 import lib.layers.odefunc as odefunc
 
-from train_misc import standard_normal_logprob, uniform_logprob
+from train_misc import standard_normal_logprob
 from train_misc import set_cnf_options, count_nfe, count_parameters, count_total_time
 from train_misc import add_spectral_norm, spectral_norm_power_iteration
 from train_misc import create_regularization_fns, get_regularization, append_regularization_to_log
@@ -27,7 +27,7 @@ from diagnostics.viz_scrna import save_trajectory, trajectory_to_video, save_tra
 SOLVERS = ["dopri5", "bdf", "rk4", "midpoint", 'adams', 'explicit_adams', 'fixed_adams']
 parser = argparse.ArgumentParser('Continuous Normalizing Flow')
 parser.add_argument('--test', type=eval, default=False, choices=[True, False])
-parser.add_argument('--full_data', type=eval, default=False, choices=[True, False])
+parser.add_argument('--full_data', type=eval, default=True, choices=[True, False])
 parser.add_argument('--data', type=str, default='dummy')
 parser.add_argument(
     "--layer_type", type=str, default="concatsquash",
@@ -151,21 +151,21 @@ def load_gaussian_data():
     x = np.random.randn(n,2) + mean * np.stack([np.ones(n), np.zeros(n)], axis=1)
     return x, np.zeros(n), None
 
-data, labels, _ = load_gaussian_curve_path()
+#data, labels, _ = load_gaussian_curve_path()
 #data, labels, _ = load_gaussian_pair_data()
 
+"""
 import scprep
-print(data.shape, labels.shape)
 fig, ax = plt.subplots(1,1)
 scprep.plot.scatter2d(data, c=labels, ax=ax)
 #scprep.plot.scatter2d(np.random.randn(10000,2), ax=ax)
 ax.set_aspect('equal')
 plt.savefig('gaussians.png')
 plt.close()
+"""
 
-exit()
 #data, labels, data_and_directions = load_circle_data()
-#data, labels, scaler = load_data_full() if args.full_data else load_data()
+data, labels, scaler = load_data_full() if args.full_data else load_data()
 timepoints = np.unique(labels)
 
 #########
@@ -302,21 +302,21 @@ def compute_loss(args, model, growth_model):
     logps = [logpz]
     
     # build growth rates
-    growthrates = [torch.zeros_like(logpz)]
-    #growthrates = [torch.ones_like(logpz)]
-    for z_state in zs[::-1]:
-        growthrates.append(growth_model(z_state))
+    growthrates = [torch.ones_like(logpz)]
+    for z_state, tp in zip(zs[::-1], timepoints[::-1][1:]):
 
+        full_state = torch.cat([z_state, tp * torch.ones(z_state.shape[0],1).to(z_state)], 1)
+        growthrates.append(growth_model(full_state))
     losses = []
     for gr, delta_logp in zip(growthrates, deltas[::-1]):
-        logpx = logps[-1] - delta_logp# + gr
-        #logpx = logps[-1] - delta_logp + torch.log(gr)
+        #logpx = logps[-1] - delta_logp# + gr
+        logpx = logps[-1] - delta_logp + torch.log(gr)
         logps.append(logpx[:-args.batch_size])
         losses.append(-torch.mean(logpx[-args.batch_size:]))
-    weights = torch.tensor([1,1,10]).to(logpx)
+    #weights = torch.tensor([1,1,10]).to(logpx)
     #weights = torch.tensor([2,1]).to(logpx)
     losses = torch.stack(losses)
-    #weights = torch.ones_like(losses).to(logpx)
+    weights = torch.ones_like(losses).to(logpx)
     losses = torch.mean(losses * weights)
     #losses = torch.mean(losses)
 
@@ -361,7 +361,8 @@ def train(args, model, growth_model):
     logger.info(model)
     logger.info("Number of trainable parameters: {}".format(count_parameters(model)))
 
-    optimizer = optim.Adam(set(model.parameters()) | set(growth_model.parameters()), 
+    #optimizer = optim.Adam(set(model.parameters()) | set(growth_model.parameters()), 
+    optimizer = optim.Adam(model.parameters(), 
                            lr=args.lr, weight_decay=args.weight_decay)
     #growth_optimizer = optim.Adam(growth_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -374,7 +375,7 @@ def train(args, model, growth_model):
     end = time.time()
     best_loss = float('inf')
     model.train()
-    growth_model.train()
+    growth_model.eval()
     for itr in range(1, args.niters + 1):
         optimizer.zero_grad()
         #growth_optimizer.zero_grad()
@@ -382,9 +383,6 @@ def train(args, model, growth_model):
         ### Train
         if args.spectral_norm: spectral_norm_power_iteration(model, 1)
         #if args.spectral_norm: spectral_norm_power_iteration(growth_model, 1)
-
-        #loss = compute_loss(args, model, growth_model)
-            
 
         loss = compute_loss(args, model, growth_model)
         loss_meter.update(loss.item())
@@ -480,6 +478,7 @@ def train(args, model, growth_model):
                     #plt.close()
                 model.train()
 
+        """
         if itr % args.viz_freq_growth == 0:
             with torch.no_grad():
                 growth_model.eval()
@@ -490,6 +489,7 @@ def train(args, model, growth_model):
                 plt.savefig(growth_filename)
                 plt.close()
                 growth_model.train()
+        """
 
         end = time.time()
     logger.info('Training has finished.')
@@ -508,7 +508,7 @@ def plot_output(args, model, growth_model=None):
     #save_trajectory_density(model, data_samples, density_dir, device=device, end_times=int_tps, ntimes=100, memory=0.1)
     #trajectory_to_video(density_dir)
 
-    if growth_model is not None:
+    if False and growth_model is not None:
         print('Plotting growth model')
         growth_filename = os.path.join(args.save, 'growth.jpg')
         utils.makedirs(os.path.dirname(growth_filename))
@@ -524,7 +524,7 @@ class GrowthNet(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.fc1 = nn.Linear(2,64)
+        self.fc1 = nn.Linear(3,64)
         self.fc2 = nn.Linear(64,64)
         self.fc3 = nn.Linear(64,1)
 
@@ -539,7 +539,8 @@ if __name__ == '__main__':
     regularization_fns, regularization_coeffs = create_regularization_fns(args)
     growth_regularization_fns, growth_regularization_coeffs = create_regularization_fns(args)
     model = build_model_tabular(args, 2, regularization_fns).to(device)
-    growth_model = GrowthNet().to(device)
+    growth_model = torch.load('growth_model_v2.ckpt').to(device)
+    #growth_model = GrowthNet().to(device)
     #growth_model = build_model_tabular(args, 2, growth_regularization_fns).to(device)
     if args.spectral_norm: add_spectral_norm(model)
     #if args.spectral_norm: add_spectral_norm(growth_model)
